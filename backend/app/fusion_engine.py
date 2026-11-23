@@ -60,6 +60,12 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        # 缺键增量行明细：按融合作业保存，绝不使用下划线占位键合并
+        self._pending_keyless: dict[int, dict[str, dict[str, Any]]] = {}
+        # 已提交原始标识：保证正常行补键重投不会被二次累计
+        self._committed_raw_ids: dict[int, set[str]] = {}
+        # 归并批次结果：记录生效边界、失败位置与关联的缺键行明细
+        self._merge_batches: dict[str, dict[str, Any]] = {}
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -431,45 +437,202 @@ class FusionEngine:
 
     def execute_delta_merge(self, job_id: int, delta_records: list[dict[str, Any]],
                             watermark_record_id: int = 0) -> dict[str, Any]:
-        """执行增量归并：将增量数据合并到融合作业的输出中。"""
+        """执行增量归并：将增量数据合并到融合作业的输出中。
+
+        归并键缺失（键字段不存在或值为 None/空串）的增量行不会被合入同一条
+        记录，而是逐条登记为缺键行明细，状态为待核键，等待补键后续补。
+        合法键值恰好是下划线 ``_`` 的行不受影响，下划线不再是缺键占位符。
+        """
         job = self._fusion_jobs.get(job_id)
         if job is None:
             return {"ok": False, "message": f"融合作业 {job_id} 不存在"}
 
-        existing = {self._make_merge_key(r, job.join_key): r for r in job.merged_records}
+        pending = self._pending_keyless.setdefault(job_id, {})
+        committed = self._committed_raw_ids.setdefault(job_id, set())
+
+        # 重建存量索引时，历史遗留的缺键行同样转入待核明细，绝不落到同一个键上
+        existing: dict[tuple[str, Any], dict[str, Any]] = {}
+        for record in job.merged_records:
+            merge_key = self._make_merge_key(record, job.join_key)
+            if merge_key is None:
+                detail = self._build_keyless_detail(record, job.join_key, "待核键")
+                pending.setdefault(detail["raw_id"], detail)
+                continue
+            existing[merge_key] = record
+
         inserted = 0
         updated = 0
         deleted = 0
+        duplicates = 0
+        failures: list[dict[str, Any]] = []
+        effective_raw_ids: list[str] = []
 
-        for delta in delta_records:
-            key = self._make_merge_key(delta, job.join_key)
+        for index, delta in enumerate(delta_records):
+            raw_id = str(
+                delta.get("_raw_id")
+                or delta.get("id")
+                or f"{job.job_code}-keyless-{self._next_keyless_seq(job_id)}"
+            )
+            merge_key = self._make_merge_key(delta, job.join_key)
             op = delta.get("_op", "upsert")
+
+            if merge_key is None:
+                # 缺键行：逐条保留明细，明确失败位置，不允许写成一个有效键
+                if op == "delete":
+                    failures.append({
+                        "index": index, "raw_id": raw_id,
+                        "reason": "归并键缺失，delete 操作无法定位目标记录",
+                    })
+                detail = self._build_keyless_detail(delta, job.join_key, "待核键", index=index)
+                detail["raw_id"] = raw_id
+                pending[raw_id] = detail
+                failures.append({
+                    "index": index, "raw_id": raw_id,
+                    "reason": "归并键缺失，增量行已转入待核键明细，补键后续补",
+                })
+                continue
+
+            # 已提交过的原始标识再次到达（含后来补键的重投）：幂等跳过，不再累计
+            if raw_id in committed:
+                duplicates += 1
+                continue
+
             if op == "delete":
-                if key in existing:
-                    del existing[key]
+                if merge_key in existing:
+                    del existing[merge_key]
                     deleted += 1
-            elif key in existing:
-                existing[key].update(delta)
+                    committed.add(raw_id)
+                    effective_raw_ids.append(raw_id)
+                else:
+                    failures.append({
+                        "index": index, "raw_id": raw_id,
+                        "merge_key": self._render_merge_key(merge_key),
+                        "reason": "delete 目标记录不存在",
+                    })
+            elif merge_key in existing:
+                existing[merge_key].update(delta)
                 updated += 1
+                committed.add(raw_id)
+                effective_raw_ids.append(raw_id)
             else:
-                existing[key] = dict(delta)
+                existing[merge_key] = dict(delta)
                 inserted += 1
+                committed.add(raw_id)
+                effective_raw_ids.append(raw_id)
+
+            # 补键重投命中此前的待核明细：该明细随本次提交关闭
+            if raw_id in pending:
+                pending[raw_id]["status"] = "已补键"
+                pending[raw_id]["join_key_value"] = merge_key[1]
+                pending[raw_id]["resolved_merge_key"] = self._render_merge_key(merge_key)
 
         job.merged_records = list(existing.values())
 
-        if watermark_record_id > 0:
+        # 只有全部行都生效时才推进水位，缺键失败不扩大已生效快照范围
+        if watermark_record_id > 0 and not failures:
             wm = self._watermarks.get(watermark_record_id)
             if wm is not None:
                 wm.previous_watermark = wm.current_watermark
                 wm.current_watermark = _now_iso()
 
-        return {
-            "ok": True,
+        keyless_details = list(pending.values())
+        batch_code = _generate_code("DMERGE", len(self._merge_batches) + 1)
+        result: dict[str, Any] = {
+            "ok": not failures,
+            "batch_code": batch_code,
+            "job_code": job.job_code,
             "inserted": inserted,
             "updated": updated,
             "deleted": deleted,
+            "duplicates": duplicates,
+            "total_after_merge": len(job.merged_records),
+            "keyless_count": len(keyless_details),
+            "keyless_details": [dict(detail) for detail in keyless_details],
+            "failures": failures,
+            "committed_raw_ids": list(effective_raw_ids),
+            "snapshot_scope": {
+                "job_code": job.job_code,
+                "effective_record_count": len(job.merged_records),
+                "effective_raw_ids": list(effective_raw_ids),
+                "pending_raw_ids": [d["raw_id"] for d in keyless_details if d["status"] == "待核键"],
+            },
+        }
+        self._merge_batches[batch_code] = dict(result)
+        return result
+
+    def list_keyless_details(self, job_id: int,
+                             status: str | None = None) -> list[dict[str, Any]]:
+        """查询归并作业下的缺键行明细，可按处理状态过滤。"""
+        pending = self._pending_keyless.get(job_id, {})
+        details = [dict(detail) for detail in pending.values()]
+        if status:
+            details = [detail for detail in details if detail.get("status") == status]
+        return details
+
+    def get_keyless_detail(self, job_id: int, raw_id: str) -> dict[str, Any] | None:
+        """按原始标识逐条查询缺键行明细（金额、原始标识、处理状态等）。"""
+        detail = self._pending_keyless.get(job_id, {}).get(raw_id)
+        return dict(detail) if detail is not None else None
+
+    def repair_keyless_record(self, job_id: int, raw_id: str,
+                              join_key_value: Any) -> dict[str, Any]:
+        """为单条缺键行补键并续补归并。
+
+        合法键值（包括恰好是下划线 ``_`` 的键）按正常键处理；空值仍然视为缺键。
+        已经补键生效的原始标识拒绝重复处理，避免二次累计。
+        """
+        job = self._fusion_jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "message": f"融合作业 {job_id} 不存在"}
+        pending = self._pending_keyless.get(job_id, {})
+        detail = pending.get(raw_id)
+        if detail is None:
+            return {"ok": False, "message": f"缺键行明细 {raw_id} 不存在"}
+        if detail.get("status") == "已补键":
+            return {"ok": False, "message": f"缺键行 {raw_id} 已补键生效，不能重复累计"}
+        if join_key_value is None or str(join_key_value) == "":
+            return {"ok": False, "message": "补键值不能为空，缺键行不能写成占位键"}
+
+        committed = self._committed_raw_ids.setdefault(job_id, set())
+        if raw_id in committed:
+            return {"ok": False, "message": f"原始标识 {raw_id} 已提交，拒绝二次累计"}
+
+        source = detail.get("source") or ""
+        merge_key = (source, join_key_value)
+        existing = {
+            self._make_merge_key(record, job.join_key): record
+            for record in job.merged_records
+            if self._make_merge_key(record, job.join_key) is not None
+        }
+        payload = dict(detail["raw_record"])
+        payload[job.join_key] = join_key_value
+        payload["_source"] = source
+
+        if merge_key in existing:
+            existing[merge_key].update(payload)
+            action = "updated"
+        else:
+            existing[merge_key] = payload
+            action = "inserted"
+        job.merged_records = list(existing.values())
+        committed.add(raw_id)
+
+        detail["status"] = "已补键"
+        detail["join_key_value"] = join_key_value
+        detail["resolved_merge_key"] = self._render_merge_key(merge_key)
+        return {
+            "ok": True,
+            "raw_id": raw_id,
+            "action": action,
+            "merge_key": self._render_merge_key(merge_key),
+            "detail": dict(detail),
             "total_after_merge": len(job.merged_records),
         }
+
+    def get_merge_batch(self, batch_code: str) -> dict[str, Any] | None:
+        """查询归并批次结果，其中关联了缺键行明细与补交可用的原始值。"""
+        batch = self._merge_batches.get(batch_code)
+        return dict(batch) if batch is not None else None
 
     def execute_backfill_with_checkpoint(self, backfill_id: int,
                                          source_records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -851,8 +1014,51 @@ class FusionEngine:
         return {"passed": passed, "gates_checked": len(gates), "violations": violations}
 
     @staticmethod
-    def _make_merge_key(record: dict[str, Any], join_key: str) -> str:
-        return f"{record.get('_source', '_')}#{record.get(join_key, '_')}"
+    def _make_merge_key(record: dict[str, Any], join_key: str) -> tuple[str, Any] | None:
+        """构造归并键。
+
+        键字段缺失或值为 None/空串时返回 None，由调用方转入缺键行明细；
+        下划线 ``_`` 是来源里的合法键值，按原值保留，绝不作为缺键占位符。
+        """
+        if join_key not in record:
+            return None
+        value = record.get(join_key)
+        if value is None or (isinstance(value, str) and value == ""):
+            return None
+        return (str(record.get("_source", "_")), value)
+
+    @staticmethod
+    def _render_merge_key(merge_key: tuple[str, Any]) -> str:
+        """把内部归并键渲染成快照详情里展示的字符串。"""
+        return f"{merge_key[0]}#{merge_key[1]}"
+
+    def _next_keyless_seq(self, job_id: int) -> int:
+        pending = self._pending_keyless.setdefault(job_id, {})
+        return len(pending) + 1
+
+    def _build_keyless_detail(self, record: dict[str, Any], join_key: str,
+                              status: str, index: int | None = None) -> dict[str, Any]:
+        """把一条缺键增量行登记为逐条可查的待核明细，原始金额完整保留。"""
+        raw_id = str(
+            record.get("_raw_id")
+            or record.get("id")
+            or f"keyless-{uuid.uuid4().hex[:12]}"
+        )
+        amount = record.get("amount")
+        if amount is None:
+            amount = record.get("value")
+        return {
+            "raw_id": raw_id,
+            "source": str(record.get("_source") or ""),
+            "join_key_field": join_key,
+            "join_key_value": None,
+            "amount": amount,
+            "status": status,
+            "batch_index": index,
+            "raw_record": dict(record),
+            "resolved_merge_key": None,
+            "registered_at": _now_iso(),
+        }
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出引擎全局数据质量快照。"""

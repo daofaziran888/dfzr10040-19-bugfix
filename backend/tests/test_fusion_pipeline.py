@@ -221,9 +221,7 @@ class TestDeltaMerge:
             None,
         )
         if existing_key:
-            import re
-            parts = existing_key.split("#", 1)
-            rec_id = parts[-1] if len(parts) > 1 else ""
+            rec_id = existing_key[1]
             delta = [{"_source": "SRC-DM2", "id": rec_id, "name": "updated", "_op": "upsert"}]
             result = engine.execute_delta_merge(job.job_id, delta)
             assert result["ok"] is True
